@@ -1,0 +1,11 @@
+{
+    "dev": {
+        "app_function": "myapp.app",
+        "aws_region": "ap-northeast-1",
+        "profile_name": "default",
+        "project_name": "tj",
+        "runtime": "python3.8",
+        "s3_bucket": "tj-zappa-serverless",
+        "parameter_depth": 1
+    }
+}
