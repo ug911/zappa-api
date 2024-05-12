@@ -1,6 +1,6 @@
 from PyPDF2 import PdfReader
 from flask import Flask, request, send_file
-from resume_redactor import extract_phone_numbers, extract_email_addresses, redact_pdf
+from resume_redactor import extract_phone_numbers, extract_email_addresses, extract_links, redact_pdf
 
 app = Flask(__name__)
 
@@ -12,6 +12,9 @@ def hello_world():
 
 @app.route('/process_pdf', methods=['POST'])
 def process_pdf():
+    # Get the value of the 'additional_words' parameter from the POST request
+    additional_words = request.form.get('additional_words')
+
     # Check if a PDF file was sent in the request
     if 'file' not in request.files:
         return 'No file part', 400
@@ -22,6 +25,10 @@ def process_pdf():
     if file.filename.split('.')[-1].lower() != 'pdf':
         return 'File must be a PDF', 400
 
+    # Check if additional_words parameter is a list
+    if additional_words and isinstance(additional_words, list):
+        return 'Additional words must be a List', 400
+
     filename_input = '/tmp/input_file.pdf'
     filename_output = '/tmp/output_file.pdf'
 
@@ -31,7 +38,7 @@ def process_pdf():
     print("Processed PDF saved successfully.")
 
     # Process the PDF file
-    process_pdf_file(file, filename_input, filename_output)
+    process_pdf_file(filename_input, filename_output, additional_words)
 
     return send_file(
         filename_output,
@@ -40,26 +47,21 @@ def process_pdf():
     )
 
 
-def process_pdf_file(pdf_file, input_filename, output_filename):
-    # Your PDF processing code goes here
-    # For example, you can use libraries like PyPDF2 or pdfplumber
-    # to extract text, manipulate pages, etc.
-    # This is just a placeholder function.
-    processed_pdf_data = pdf_file.read()  # Placeholder processing, just returning the file as is
-
+def process_pdf_file(input_filename, output_filename, additional_words):
     document = PdfReader(input_filename)
     text = document.pages[0].extract_text()
-    print(text.title())
-    phone_numbers = extract_phone_numbers(text.title())
-    print(phone_numbers)
-    emails = extract_email_addresses(text.title())
-    print(emails)
+    phone_numbers = extract_phone_numbers(text)
+    emails = extract_email_addresses(text)
+    links = extract_links(text)
+    list_of_regex_words = phone_numbers + emails + links + additional_words
+    words_to_redact = [x for x in list_of_regex_words if x != '']
 
-    list_of_regex_words = phone_numbers + emails
-    print(list_of_regex_words)
-    redact_pdf(input_file=input_filename, regex_list=list_of_regex_words, manual_words=[], output_file=output_filename)
+    print(text)
+    print("Phone: {}\nEmails: {}\nLinks: {}\nFinal: {}".format(phone_numbers, emails, links, words_to_redact))
 
-    return processed_pdf_data
+    redact_pdf(input_file=input_filename, regex_list=words_to_redact, output_file=output_filename)
+
+    return True
 
 
 if __name__ == '__main__':
