@@ -10,10 +10,10 @@ def hello_world():
     return 'Hello World!'
 
 
-@app.route('/process_pdf', methods=['POST'])
-def process_pdf():
+@app.route('/redact_resume', methods=['POST'])
+def redact_resume():
     # Get the value of the 'additional_words' parameter from the POST request
-    additional_words = request.form.get('additional_words')
+    candidate_name = request.form.get('candidate_name')
 
     # Check if a PDF file was sent in the request
     if 'file' not in request.files:
@@ -26,8 +26,8 @@ def process_pdf():
         return 'File must be a PDF', 400
 
     # Check if additional_words parameter is a list
-    if additional_words and isinstance(additional_words, list):
-        return 'Additional words must be a List', 400
+    if candidate_name and not isinstance(candidate_name, str):
+        return 'Candidate Name must be a String', 400
 
     filename_input = '/tmp/input_file.pdf'
     filename_output = '/tmp/output_file.pdf'
@@ -38,7 +38,7 @@ def process_pdf():
     print("Processed PDF saved successfully.")
 
     # Process the PDF file
-    process_pdf_file(filename_input, filename_output, additional_words)
+    process_pdf_file(filename_input, filename_output, candidate_name)
 
     return send_file(
         filename_output,
@@ -47,13 +47,14 @@ def process_pdf():
     )
 
 
-def process_pdf_file(input_filename, output_filename, additional_words):
+def process_pdf_file(input_filename, output_filename, candidate_name):
     document = PdfReader(input_filename)
     text = document.pages[0].extract_text()
     phone_numbers = extract_phone_numbers(text)
     emails = extract_email_addresses(text)
     links = extract_links(text)
-    list_of_regex_words = phone_numbers + emails + links + additional_words
+    print("Phone: {}\nEmails: {}\nLinks: {}\nInput Words: {}".format(phone_numbers, emails, links, candidate_name))
+    list_of_regex_words = phone_numbers + emails + links + [candidate_name]
     words_to_redact = [x for x in list_of_regex_words if x != '']
 
     print(text)
