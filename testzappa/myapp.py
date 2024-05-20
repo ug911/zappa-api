@@ -1,13 +1,63 @@
 from PyPDF2 import PdfReader
 from flask import Flask, request, send_file
 from resume_redactor import extract_phone_numbers, extract_email_addresses, extract_links, redact_pdf
+import boto3
+import json
+
+OUTPUT_FILE_BUCKET = 'tech-japan-resumes'
+
+s3 = boto3.client('s3')
 
 app = Flask(__name__)
-
 
 @app.route('/')
 def hello_world():
     return 'Hello World!'
+
+def read_pdf_from_s3(bucket_name, file_name):
+    obj = s3.get_object(Bucket=bucket_name, Key=file_name)
+    pdf_data = obj['Body'].read()
+    return pdf_data
+
+def write_pdf_to_s3(pdf_data, bucket_name, file_name):
+    s3.put_object(Body=pdf_data, Bucket=bucket_name, Key=file_name)
+    return True
+
+@app.route('/redact_resume_s3', methods=['POST'])
+def redact_resume():
+    # Get the value of the 'additional_words' parameter from the POST request
+    candidate_name = request.form.get('candidate_name')
+    input_file_bucket = request.form.get('bucket')
+    input_file_path = request.form.get('filepath')
+
+    file = read_pdf_from_s3(input_file_bucket, input_file_path)
+
+    # Check if additional_words parameter is a list
+    if candidate_name and not isinstance(candidate_name, str):
+        return 'Candidate Name must be a String', 400
+
+    filename_input = '/tmp/input_file.pdf'
+    filename_output = '/tmp/output_file.pdf'
+
+    with open(filename_input, 'wb') as f:
+        f.write(file)
+
+    print("Processed PDF saved successfully.")
+
+    # Process the PDF file
+    process_pdf_file(filename_input, filename_output, candidate_name)
+
+    with open(filename_output, 'rb') as f:
+        output_file = f.read()
+
+    write_pdf_to_s3(output_file, OUTPUT_FILE_BUCKET, input_file_path)
+
+    response = app.response_class(
+        response=json.dumps({'output_file_bucket': OUTPUT_FILE_BUCKET, 'output_file_name': input_file_name}),
+        status=200,
+        mimetype='application/json'
+    )
+    return response
 
 
 @app.route('/redact_resume', methods=['POST'])
