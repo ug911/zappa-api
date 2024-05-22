@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 import requests
 import json
 
-OUTPUT_FILE_BUCKET = 'techjapan-hub-filesXX'
+OUTPUT_FILE_BUCKET = 'techjapan-hub-files'
 OUTPUT_FILE_BUCKET_TEST = 'tj-zappa-serverless'
 
 s3 = boto3.client('s3')
