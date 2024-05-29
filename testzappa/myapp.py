@@ -1,5 +1,6 @@
 from PyPDF2 import PdfReader
 from flask import Flask, request, send_file
+from flask_cors import CORS
 from resume_redactor import extract_phone_numbers, extract_email_addresses, extract_links, redact_pdf
 import boto3
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ OUTPUT_FILE_BUCKET_TEST = 'tj-zappa-serverless'
 s3 = boto3.client('s3')
 
 app = Flask(__name__)
+CORS(app)
 
 @app.route('/')
 def hello_world():
