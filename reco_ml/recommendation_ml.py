@@ -2,7 +2,7 @@
 import os
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Any
 
 import numpy as np
 from flask import Flask, request, jsonify
@@ -73,38 +73,51 @@ def _ensure_2d_float32(X: np.ndarray, expected_n_features: int = None) -> np.nda
     return X
 
 
-def _extract_pos_proba(onnx_outputs: List[np.ndarray]) -> np.ndarray:
+def _extract_pos_proba(onnx_outputs: List[Any], positive_class=1) -> np.ndarray:
     """
-    Convert ONNX outputs into P(class=1) per row.
+    Supports skl2onnx classifier outputs:
+      - outputs[0] = labels (ints)
+      - outputs[1] = probabilities as ZipMap (list/array of dicts) OR ndarray
 
-    Common cases with skl2onnx:
-      - outputs[0] is probability array of shape (N, 2) -> take [:, 1]
-      - outputs[0] is probability of positive class shape (N, 1) or (N,) -> flatten
-      - If the first output looks like labels and second looks like probs, try second.
+    Returns float array of shape (N,) with P(class=positive_class).
     """
     if not onnx_outputs:
         raise RuntimeError("ONNX session returned no outputs")
 
-    # Heuristic: use the output with the largest last dimension if it's 2
-    for out in onnx_outputs:
-        if isinstance(out, np.ndarray) and out.ndim >= 2 and out.shape[-1] == 2:
-            return out[:, 1].ravel()
+    # Try the 2nd output first (usually probabilities)
+    probs = onnx_outputs[1] if len(onnx_outputs) > 1 else onnx_outputs[0]
 
-    # Otherwise, try the first numeric array
-    arr = None
-    for out in onnx_outputs:
-        if isinstance(out, np.ndarray) and np.issubdtype(out.dtype, np.number):
-            arr = out
-            break
-    if arr is None:
-        raise RuntimeError("Could not find numeric output in ONNX results")
+    # Case A: probs is already an ndarray, e.g. shape (N,2)
+    if isinstance(probs, np.ndarray) and np.issubdtype(probs.dtype, np.number):
+        # If 2 columns, take column for positive class (assume class order [0,1])
+        if probs.ndim == 2 and probs.shape[1] >= 2:
+            return probs[:, 1].astype(np.float32).ravel()
+        # If 1-D or (N,1), flatten
+        return probs.astype(np.float32).ravel()
 
-    if arr.ndim == 2 and arr.shape[1] == 1:
-        return arr.ravel()
-    if arr.ndim == 1:
-        return arr
-    # Last resort: take last column as "positive" if > 1 columns
-    return arr[:, -1].ravel()
+    # Case B: probs is ZipMap -> list/array of dicts: [{0: p0, 1: p1}, ...]
+    if isinstance(probs, (list, tuple)) or (isinstance(probs, np.ndarray) and probs.dtype == object):
+        out = []
+        for row in probs:
+            if isinstance(row, dict):
+                # keys might be int or str
+                if positive_class in row:
+                    out.append(float(row[positive_class]))
+                elif str(positive_class) in row:
+                    out.append(float(row[str(positive_class)]))
+                else:
+                    # Fallback: pick the highest-prob class
+                    out.append(float(max(row.values())))
+            else:
+                raise RuntimeError(f"Unexpected ZipMap row type: {type(row)}")
+        return np.asarray(out, dtype=np.float32)
+
+    # Last resort: scan all outputs for a 2-col ndarray
+    for out in onnx_outputs:
+        if isinstance(out, np.ndarray) and out.ndim == 2 and out.shape[1] == 2:
+            return out[:, 1].astype(np.float32).ravel()
+
+    raise RuntimeError("Could not find probability-like output in ONNX results")
 
 
 def _concat_if_present(body: dict) -> Tuple[np.ndarray, int]:
@@ -211,7 +224,6 @@ def predict():
 
         # Enforce expected feature size if available from model
         X = _ensure_2d_float32(X_raw, expected_n_features=N_FEATURES)
-
         outputs = SESSION.run(None, {INPUT_NAME: X})
         pos_proba = _extract_pos_proba(outputs)
         labels = (pos_proba >= thr).astype(int).tolist()
