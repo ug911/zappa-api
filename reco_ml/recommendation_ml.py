@@ -2,7 +2,7 @@
 import os
 import json
 from pathlib import Path
-from typing import List, Tuple, Any
+from typing import Tuple, List, Dict, Any
 
 import numpy as np
 from flask import Flask, request, jsonify
@@ -120,29 +120,104 @@ def _extract_pos_proba(onnx_outputs: List[Any], positive_class=1) -> np.ndarray:
     raise RuntimeError("Could not find probability-like output in ONNX results")
 
 
-def _concat_if_present(body: dict) -> Tuple[np.ndarray, int]:
+def _concat_if_present(body: Dict[str, Any]) -> Tuple[np.ndarray, List[Tuple[str, str]]]:
     """
-    Accept either:
-      - {"features": [[...], [...]]}
-      - or {"resumeEmbedding": [...], "positionEmbedding": [...]}
-    Returns (X, n_features_inferred)
+    Build a batch X where each row is [candidateEmbedding || positionEmbedding].
+    Returns:
+      X: np.ndarray of shape (batch_size, n_features), dtype float32
+      pair_ids: list of (candidateId, positionId) tuples aligned to X rows
+
+    Supports:
+      A) {"positionEmbedding": [...], "candidates": [{"candidateEmbedding": [...]}...]}
+      B) {"candidateEmbedding": [...], "positions": [{"positionEmbedding": [...]}...]}
+      Legacy:
+         - {"features": [[...], [...]]}   -> ids become ("row_i","n/a")
+         - {"resumeEmbedding": [...], "positionEmbedding": [...]} -> single row
     """
+    pair_ids: List[Tuple[str, str]] = []
+
+    # --- New schema: A) single position, many candidates
+    if "positionEmbedding" in body and "candidates" in body:
+        pos_id = str(body.get("positionId", ""))  # optional
+        p = np.asarray(body["positionEmbedding"], dtype=np.float32)
+        if p.ndim != 1:
+            raise ValueError("positionEmbedding must be a 1D array")
+
+        candidates = body.get("candidates", [])
+        if not isinstance(candidates, list) or len(candidates) == 0:
+            raise ValueError("'candidates' must be a non-empty list")
+
+        rows = []
+        for i, cand in enumerate(candidates):
+            cid = str(cand.get("candidateId", f"candidate_{i}"))
+            # Accept either "candidateEmbedding" (preferred) or legacy "resumeEmbedding"
+            if "candidateEmbedding" in cand:
+                c = np.asarray(cand["candidateEmbedding"], dtype=np.float32)
+            elif "resumeEmbedding" in cand:  # soft fallback
+                c = np.asarray(cand["resumeEmbedding"], dtype=np.float32)
+            else:
+                raise ValueError(f"Missing candidateEmbedding for candidate index {i}")
+            if c.ndim != 1:
+                raise ValueError(f"candidateEmbedding at index {i} must be 1D")
+
+            rows.append(np.concatenate([c, p], axis=0))
+            pair_ids.append((cid, pos_id))
+        X = np.stack(rows, axis=0)
+        return X, pair_ids
+
+    # --- New schema: B) single candidate, many positions
+    if "candidateEmbedding" in body and "positions" in body:
+        cand_id = str(body.get("candidateId", ""))  # optional
+        c = np.asarray(body["candidateEmbedding"], dtype=np.float32)
+        if c.ndim != 1:
+            raise ValueError("candidateEmbedding must be a 1D array")
+
+        positions = body.get("positions", [])
+        if not isinstance(positions, list) or len(positions) == 0:
+            raise ValueError("'positions' must be a non-empty list")
+
+        rows = []
+        for i, pos in enumerate(positions):
+            pid = str(pos.get("positionId", f"position_{i}"))
+            # Accept "positionEmbedding" (preferred). Also tolerate accidental "positionIdEmbedding".
+            emb_key = "positionEmbedding" if "positionEmbedding" in pos else (
+                "positionIdEmbedding" if "positionIdEmbedding" in pos else None
+            )
+            if emb_key is None:
+                raise ValueError(f"Missing positionEmbedding for position index {i}")
+            p = np.asarray(pos[emb_key], dtype=np.float32)
+            if p.ndim != 1:
+                raise ValueError(f"{emb_key} at index {i} must be 1D")
+
+            rows.append(np.concatenate([c, p], axis=0))
+            pair_ids.append((cand_id, pid))
+        X = np.stack(rows, axis=0)
+        return X, pair_ids
+
+    # --- Legacy: explicit features matrix
     if "features" in body:
         X = np.asarray(body["features"], dtype=np.float32)
         if X.ndim == 1:
             X = X.reshape(1, -1)
-        return X, X.shape[1]
+        # fabricate ids
+        pair_ids = [(f"row_{i}", "n/a") for i in range(X.shape[0])]
+        return X, pair_ids
 
+    # --- Legacy: single resume+position embedding pair
     if "resumeEmbedding" in body and "positionEmbedding" in body:
         r = np.asarray(body["resumeEmbedding"], dtype=np.float32)
         p = np.asarray(body["positionEmbedding"], dtype=np.float32)
         if r.ndim != 1 or p.ndim != 1:
             raise ValueError("resumeEmbedding and positionEmbedding must be 1D arrays")
         X = np.concatenate([r, p], axis=0).reshape(1, -1)
-        return X, X.shape[1]
+        pair_ids = [("candidate", "position")]
+        return X, pair_ids
 
     raise ValueError(
-        "Request must include either 'features': [[...]] or both 'resumeEmbedding' and 'positionEmbedding'."
+        "Invalid request. Provide either:\n"
+        "A) {'positionEmbedding': [...], 'candidates': [{'candidateEmbedding': [...]}...]}\n"
+        "B) {'candidateEmbedding': [...], 'positions': [{'positionEmbedding': [...]}...]}\n"
+        "Or legacy forms: {'features': [[...]]} or {'resumeEmbedding': [...], 'positionEmbedding': [...]}."
     )
 
 
@@ -195,45 +270,65 @@ def ping():
 @app.route("/predict", methods=["POST"])
 def predict():
     """
-    POST JSON:
-      - Option A:
-        {
-          "features": [[f1, f2, ..., fn], [...]],
-          "threshold": 0.5   # optional, overrides default
-        }
-      - Option B:
-        {
-          "resumeEmbedding": [...],
-          "positionEmbedding": [...],
-          "threshold": 0.5   # optional
-        }
+    Accepted request payloads:
 
-    Returns:
-      {
-        "probas": [p1, p2, ...],
-        "labels": [0/1, ...],
-        "n_features": n,
-        "threshold": t
-      }
+    A) Single position, many candidates
+       {
+         "positionId": "...",                     # optional but recommended
+         "positionEmbedding": [...],              # 1D float list
+         "candidates": [
+           {"candidateId": "...", "candidateEmbedding": [...]},
+           {"candidateId": "...", "candidateEmbedding": [...]}
+         ]
+       }
+
+    B) Single candidate, many positions
+       {
+         "candidateId": "...",                    # optional but recommended
+         "candidateEmbedding": [...],             # 1D float list
+         "positions": [
+           {"positionId": "...", "positionEmbedding": [...]},
+           {"positionId": "...", "positionEmbedding": [...]}
+         ]
+       }
+
+    Legacy (still supported for compatibility):
+       - {"features": [[...], [...]]}
+       - {"resumeEmbedding": [...], "positionEmbedding": [...]}
+
+    Returns (JSON array at top level):
+       [
+         {"candidateId": "c1", "positionId": "pA", "probability": 0.8732},
+         {"candidateId": "c2", "positionId": "pA", "probability": 0.4411},
+         ...
+       ]
     """
     try:
         body = request.get_json(force=True, silent=False) or {}
-        X_raw, inferred = _concat_if_present(body)
 
-        thr = float(body.get("threshold", PRED_THRESHOLD))
+        # Build the model input batch and keep track of (candidateId, positionId) per row
+        X_raw, pair_ids = _concat_if_present(body)
 
         # Enforce expected feature size if available from model
         X = _ensure_2d_float32(X_raw, expected_n_features=N_FEATURES)
+
+        # Inference
         outputs = SESSION.run(None, {INPUT_NAME: X})
         pos_proba = _extract_pos_proba(outputs)
-        labels = (pos_proba >= thr).astype(int).tolist()
 
-        return jsonify({
-            "probas": [float(p) for p in pos_proba],
-            "labels": labels,
-            "n_features": X.shape[1],
-            "threshold": thr
-        })
+        # Normalize to 1D list of floats
+        probas = [float(p) for p in np.asarray(pos_proba).reshape(-1)]
+
+        # Map back to (candidateId, positionId)
+        results = []
+        for (cid, pid), p in zip(pair_ids, probas):
+            results.append({
+                "candidateId": cid,
+                "positionId": pid,
+                "probability": p
+            })
+
+        return jsonify(results)
 
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
@@ -253,5 +348,3 @@ def metadata():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
